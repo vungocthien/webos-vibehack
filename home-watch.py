@@ -29,17 +29,37 @@ def log(*args):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), *args, flush=True)
 
 
-async def watch(host):
-    ws = await lgtv.session(host, ping_interval=10, ping_timeout=10)
-    log("connected to", host)
+async def launch(ws):
+    await ws.send(json.dumps({"type": "request", "id": "launch", "uri": "ssap://system.launcher/launch",
+                              "payload": {"id": LAUNCHER}}))
+
+
+async def watch(ws, just_on):
     last_redirect = float("-inf")
     try:
         await ws.send(json.dumps({"type": "subscribe", "id": "fg",
                                   "uri": "ssap://com.webos.applicationManager/getForegroundAppInfo",
                                   "payload": {"extraInfo": True}}))
+        # webOS 5 hides its boot-time home bar after a few seconds, often before we reconnect, so
+        # watch the power state too: the TV coming on (from standby, or right after it was
+        # unreachable) opens the launcher.
+        await ws.send(json.dumps({"type": "subscribe", "id": "power",
+                                  "uri": "ssap://com.webos.service.tvpower/power/getPowerState"}))
         home_open = False
+        active = not just_on
         async for raw in ws:
             msg = json.loads(raw)
+            if msg.get("id") == "power":
+                payload = msg.get("payload", {})
+                if payload.get("processing"):
+                    continue
+                was_active, active = active, payload.get("state") == "Active"
+                if active != was_active:
+                    log("power:", payload.get("state"))
+                if active and not was_active:
+                    await launch(ws)
+                    log("TV turned on -> launcher")
+                continue
             if msg.get("id") != "fg":
                 continue
             # extraInfo lists every foreground window: on webOS 5 the home bar opens over the app
@@ -56,24 +76,29 @@ async def watch(host):
                 last_redirect = float("-inf")
                 continue
             last_redirect = now
-            await ws.send(json.dumps({"type": "request", "id": "launch", "uri": "ssap://system.launcher/launch",
-                                      "payload": {"id": LAUNCHER}}))
+            await launch(ws)
             log("LG home -> launcher")
     finally:
         await ws.close()
 
 
 async def main(host):
-    delay = 5
+    failures, last_failure = 0, float("-inf")
     while True:
+        # Connecting right after a run of failures means the TV just came on. A single failure is
+        # a network blip, and a long gap since the last failure means this Mac was asleep; either
+        # way the TV may be mid-show, so leave it alone.
+        just_on = failures >= 2 and time.time() - last_failure < 60
         try:
-            await watch(host)
-            delay = 5
+            ws = await lgtv.session(host, ping_interval=10, ping_timeout=10)
+            log("connected to", host)
+            failures = 0
+            await watch(ws, just_on)
         except (OSError, asyncio.TimeoutError, lgtv.websockets.WebSocketException) as e:
-            # TV off, in standby or off the network: keep trying, but back off.
+            # TV off, in standby or off the network: keep trying, quickly enough to catch it waking.
             log("not connected:", type(e).__name__, e)
-            delay = min(delay * 2, 20)
-        await asyncio.sleep(delay)
+            failures, last_failure = failures + 1, time.time()
+        await asyncio.sleep(3)
 
 
 if __name__ == "__main__":
