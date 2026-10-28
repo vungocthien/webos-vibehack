@@ -21,7 +21,7 @@ import time
 import lgtv
 
 LAUNCHER = "com.gathin.tvhome"
-LG_HOME = "com.webos.app.home"
+LG_HOME = {"com.webos.app.home", "com.webos.app.fullhome"}   # fullhome: webOS 5's overlay home bar
 ESCAPE_SECONDS = 3.0
 
 
@@ -32,22 +32,28 @@ def log(*args):
 async def watch(host):
     ws = await lgtv.session(host, ping_interval=10, ping_timeout=10)
     log("connected to", host)
-    last_redirect = 0.0
+    last_redirect = float("-inf")
     try:
         await ws.send(json.dumps({"type": "subscribe", "id": "fg",
                                   "uri": "ssap://com.webos.applicationManager/getForegroundAppInfo",
-                                  "payload": {}}))
+                                  "payload": {"extraInfo": True}}))
+        home_open = False
         async for raw in ws:
             msg = json.loads(raw)
             if msg.get("id") != "fg":
                 continue
-            app = msg.get("payload", {}).get("appId")
-            if app != LG_HOME:
+            # extraInfo lists every foreground window: on webOS 5 the home bar opens over the app
+            # instead of replacing it, so the plain appId never changes.
+            payload = msg.get("payload", {})
+            windows = payload.get("foregroundAppInfo") or [payload]
+            was_open, home_open = home_open, any(
+                w.get("appId") in LG_HOME or w.get("windowType") == "_WEBOS_WINDOW_TYPE_HOME" for w in windows)
+            if not home_open or was_open:
                 continue
             now = time.monotonic()
             if now - last_redirect < ESCAPE_SECONDS:
                 log("Home pressed twice: staying on LG home")
-                last_redirect = 0.0
+                last_redirect = float("-inf")
                 continue
             last_redirect = now
             await ws.send(json.dumps({"type": "request", "id": "launch", "uri": "ssap://system.launcher/launch",
